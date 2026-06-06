@@ -1,4 +1,16 @@
 import os
+import sys
+
+# Python 3.13 Compatibility Patch
+try:
+    import cgi
+except ImportError:
+    try:
+        import legacy_cgi as cgi
+        sys.modules['cgi'] = cgi
+    except ImportError:
+        pass
+
 from fastapi import FastAPI, HTTPException, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -102,6 +114,7 @@ class AnalysisRequest(BaseModel):
     text: str
     context: Optional[str] = None
     language: Optional[str] = "auto"
+    document_id: Optional[int] = None
 
 class LexiconMap(BaseModel):
     words: Dict[str, WordBreakdown]
@@ -114,6 +127,49 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# --- Helper Functions for AI ---
+
+def get_filtered_models():
+    try:
+        models = []
+        exclude = ['tts', 'robotics', 'computer-use', 'image', 'clip', 'deep-research', '2.5']
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                if not any(x in m.name.lower() for x in exclude):
+                    models.append(m.name)
+        models.sort(key=lambda x: ('2.0' in x or 'flash' in x), reverse=True)
+        return models if models else ['models/gemini-1.5-flash', 'models/gemini-pro-latest']
+    except:
+        return ['models/gemini-1.5-flash']
+
+async def gemini_ai_call(prompt: str, is_json: bool = False):
+    models = get_filtered_models()
+    for model_name in models:
+        try:
+            config = {"response_mime_type": "application/json"} if is_json else None
+            model = genai.GenerativeModel(model_name, generation_config=config)
+            response = await asyncio.to_thread(model.generate_content, prompt)
+            return response.text
+        except Exception as e:
+            print(f"INFO: AI call failed with {model_name}: {e}")
+            continue
+    return None
+
+def safe_json_loads(text: str):
+    if not text:
+        return None
+    try:
+        # Find the first { and last } to extract the JSON object
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            json_str = text[start:end+1]
+            return json.loads(json_str)
+        return json.loads(text)
+    except Exception as e:
+        print(f"ERROR: JSON parsing failed: {e}. Raw text: {text[:200]}...")
+        return None
 
 # --- DB Endpoints ---
 
@@ -140,6 +196,17 @@ def export_project(project_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Project not found")
     return project
 
+@app.delete("/projects/{project_id}")
+def delete_project(project_id: int, db: Session = Depends(get_db)):
+    if project_id == 1:
+        raise HTTPException(status_code=400, detail="Cannot delete the default project")
+    project = db.query(db_module.Project).filter(db_module.Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    db.delete(project)
+    db.commit()
+    return {"message": "Project deleted"}
+
 @app.post("/documents", response_model=DocumentSchema)
 def create_document(doc: DocumentCreate, db: Session = Depends(get_db)):
     db_doc = db_module.Document(**doc.dict())
@@ -147,6 +214,38 @@ def create_document(doc: DocumentCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_doc)
     return db_doc
+
+@app.get("/documents/{doc_id}", response_model=DocumentSchema)
+def get_document(doc_id: int, db: Session = Depends(get_db)):
+    db_doc = db.query(db_module.Document).filter(db_module.Document.id == doc_id).first()
+    if not db_doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return db_doc
+
+@app.delete("/documents/{doc_id}")
+def delete_document(doc_id: int, db: Session = Depends(get_db)):
+    db_doc = db.query(db_module.Document).filter(db_module.Document.id == doc_id).first()
+    if not db_doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    db.delete(db_doc)
+    db.commit()
+    return {"message": "Document deleted"}
+
+@app.delete("/documents/{doc_id}/lexicon/{word}")
+def delete_lexicon_entry(doc_id: int, word: str, db: Session = Depends(get_db)):
+    db_doc = db.query(db_module.Document).filter(db_module.Document.id == doc_id).first()
+    if not db_doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    lexicon = db_doc.lexicon_json or {}
+    if word in lexicon:
+        del lexicon[word]
+        # Important: reassignment is needed for SQLAlchemy to detect the change in a JSON field
+        db_doc.lexicon_json = dict(lexicon)
+        db.commit()
+        return {"message": f"Word '{word}' deleted from lexicon"}
+    
+    raise HTTPException(status_code=404, detail="Word not found in lexicon")
 
 @app.put("/documents/{doc_id}", response_model=DocumentSchema)
 def update_document(doc_id: int, doc_update: Dict[str, Any], db: Session = Depends(get_db)):
@@ -203,8 +302,14 @@ async def detect_language(request: Dict[str, str]):
     try:
         result = await translator.detect(text)
         return {"language": result.lang}
-    except:
-        return {"language": "sanskrit"}
+    except Exception as e:
+        print(f"INFO: googletrans detect failed: {e}. Trying Gemini fallback...")
+        try:
+            prompt = f"Detect the language of the following text. Return ONLY the language name in lowercase (e.g., 'sanskrit', 'tamil', 'hindi').\n\nText: {text}"
+            lang = await gemini_ai_call(prompt)
+            return {"language": lang.strip().lower() if lang else "sanskrit"}
+        except:
+            return {"language": "sanskrit"}
 
 @app.post("/transliterate")
 async def transliterate_text(request: Dict[str, str]):
@@ -212,20 +317,24 @@ async def transliterate_text(request: Dict[str, str]):
     # Placeholder: real transliteration would use a library like indic-transliteration
     return {"transliterated_text": text}
 
-# --- Existing Analysis Logic ---
-
-def get_filtered_models():
+@app.post("/translate")
+async def translate_text(request: Dict[str, str]):
+    text = request.get("text", "")
+    target_lang = request.get("target", "en")
     try:
-        models = []
-        exclude = ['tts', 'robotics', 'computer-use', 'image', 'clip', 'deep-research', '2.5']
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                if not any(x in m.name.lower() for x in exclude):
-                    models.append(m.name)
-        models.sort(key=lambda x: ('2.0' in x or 'flash' in x), reverse=True)
-        return models if models else ['models/gemini-1.5-flash', 'models/gemini-pro-latest']
-    except:
-        return ['models/gemini-1.5-flash']
+        res = await translator.translate(text, dest=target_lang)
+        return {"translation": res.text}
+    except Exception as e:
+        print(f"ERROR: Translation failed: {e}")
+        # Fallback to Gemini if googletrans fails
+        try:
+            prompt = f"Translate the following text to English. Return ONLY the translated text.\n\nText: {text}"
+            translation = await gemini_ai_call(prompt)
+            return {"translation": translation or "Translation failed."}
+        except:
+            return {"translation": "Translation failed."}
+
+# --- Analysis Logic ---
 
 async def process_chunk(words_subset: List[str], language: str, full_context: str):
     prompt = f"""
@@ -250,16 +359,9 @@ async def process_chunk(words_subset: List[str], language: str, full_context: st
     }}
     """
     
-    models = get_filtered_models()
-    for model_name in models:
-        try:
-            model = genai.GenerativeModel(model_name, generation_config={"response_mime_type": "application/json"})
-            response = await asyncio.to_thread(model.generate_content, prompt)
-            return json.loads(response.text)
-        except Exception as e:
-            print(f"INFO: Chunk failed with {model_name}: {e}")
-            continue
-    return {"words": {}}
+    res = await gemini_ai_call(prompt, is_json=True)
+    parsed = safe_json_loads(res)
+    return parsed if parsed else {"words": {}}
 
 processing_progress = {"current": 0, "total": 0}
 
@@ -270,32 +372,65 @@ async def get_progress():
     return {"percentage": int((processing_progress["current"] / processing_progress["total"]) * 100)}
 
 @app.post("/process_document", response_model=LexiconMap)
-async def process_document(request: AnalysisRequest):
+async def process_document(request: AnalysisRequest, db: Session = Depends(get_db)):
     global processing_progress
     if not GENI_API_KEY or GENI_API_KEY == "your_gemini_api_key_here":
         raise HTTPException(status_code=500, detail="API key missing.")
     
     processing_progress = {"current": 0, "total": 0}
     
-    try:
-        doc_trans = await translator.translate(request.text, dest='en')
-        document_translation = doc_trans.text
-    except:
-        document_translation = "Translation pending..."
+    db_doc = None
+    existing_lexicon = {}
+    document_translation = "Translation pending..."
+
+    if request.document_id:
+        db_doc = db.query(db_module.Document).filter(db_module.Document.id == request.document_id).first()
+        if db_doc:
+            existing_lexicon = db_doc.lexicon_json or {}
+            document_translation = db_doc.doc_translation or "Translation pending..."
+
+    # 1. Get overall translation if not already exists
+    if document_translation == "Translation pending...":
+        try:
+            doc_trans = await translator.translate(request.text, dest='en')
+            document_translation = doc_trans.text
+        except Exception as e:
+            print(f"INFO: googletrans translate failed: {e}. Trying Gemini fallback...")
+            try:
+                prompt = f"Translate the following {request.language} text to English. Return ONLY the translated text.\n\nText: {request.text}"
+                document_translation = await gemini_ai_call(prompt)
+            except:
+                pass
+        
+        if db_doc and document_translation:
+            db_doc.doc_translation = document_translation
+            db.commit()
 
     all_tokens = list(set(re.findall(r'[\u0900-\u0DFF\w]+', request.text)))
     all_tokens = [t for t in all_tokens if len(t) > 0]
     
+    # Filter out already processed tokens
+    tokens_to_process = [t for t in all_tokens if t not in existing_lexicon]
+    
+    if not tokens_to_process:
+        return { "document_translation": document_translation, "words": existing_lexicon }
+
     chunk_size = 10
-    chunks = [all_tokens[i:i + chunk_size] for i in range(0, len(all_tokens), chunk_size)]
+    chunks = [tokens_to_process[i:i + chunk_size] for i in range(0, len(tokens_to_process), chunk_size)]
     
     processing_progress["total"] = len(chunks)
-    final_lexicon = {}
+    final_lexicon = existing_lexicon.copy()
+    
     for i, chunk in enumerate(chunks):
         processing_progress["current"] = i + 1
         result = await process_chunk(chunk, request.language, request.text)
         if "words" in result:
             final_lexicon.update(result["words"])
+            # Persistent Save
+            if db_doc:
+                db_doc.lexicon_json = final_lexicon
+                db.commit()
+                
         await asyncio.sleep(0.5)
             
     processing_progress = {"current": 0, "total": 0}
@@ -329,16 +464,10 @@ async def analyze_text(request: AnalysisRequest):
     }}
     """
     
-    models = get_filtered_models()
-    for model_name in models:
-        try:
-            model = genai.GenerativeModel(model_name, generation_config={"response_mime_type": "application/json"})
-            response = await asyncio.to_thread(model.generate_content, prompt)
-            data = json.loads(response.text)
-            return AnalysisResponse(**data)
-        except Exception as e:
-            print(f"INFO: Analysis failed with {model_name}: {e}")
-            continue
+    res = await gemini_ai_call(prompt, is_json=True)
+    data = safe_json_loads(res)
+    if data:
+        return AnalysisResponse(**data)
             
     raise HTTPException(status_code=500, detail="Linguistic analysis failed across all models.")
 

@@ -18,6 +18,10 @@ Thumbs.db
 backend/.env
 backend/.env.local
 
+# Database
+*.db
+*.sqlite3
+
 # Logs
 npm-debug.log*
 yarn-debug.log*

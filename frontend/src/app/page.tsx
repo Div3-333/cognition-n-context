@@ -106,6 +106,40 @@ export default function Home() {
     }
   };
 
+  const deleteDocument = async (docId: number) => {
+    try {
+      await apiFetch(`/documents/${docId}`, { method: "DELETE" });
+      setDocuments(documents.filter(d => d.id !== docId));
+      if (activeDoc?.id === docId) {
+        setActiveDoc(null);
+        setInputText("");
+        setDocTitle("");
+      }
+      showNotification("Document deleted", "success");
+    } catch (e) {
+      showNotification("Failed to delete document");
+    }
+  };
+
+  const deleteLexiconEntry = async (word: string) => {
+    if (!activeDoc) return;
+    try {
+      await apiFetch(`/documents/${activeDoc.id}/lexicon/${encodeURIComponent(word)}`, { method: "DELETE" });
+      const newLexicon = { ...lexicon };
+      delete newLexicon[word];
+      setLexicon(newLexicon);
+      
+      if (analysis) {
+        const newBreakdown = analysis.breakdown.filter(b => b.word !== word);
+        setAnalysis({ ...analysis, breakdown: newBreakdown });
+      }
+      
+      showNotification(`Deleted "${word}" from library`, "success");
+    } catch (e) {
+      showNotification("Failed to delete lexicon entry");
+    }
+  };
+
   const loadDocument = (doc: Document) => {
     setActiveDoc(doc);
     setInputText(doc.content);
@@ -124,9 +158,16 @@ export default function Home() {
       fetchStats(latest.id);
     } else {
       setActiveInterpretation(null);
-      setLexicon({});
-      setDocTranslation("");
-      setStats(null);
+      setLexicon(doc.lexicon_json || {});
+      setDocTranslation(doc.doc_translation || "");
+      fetchStats(doc.id);
+      // Ensure we have the latest data from server
+      try {
+        apiFetch(`/documents/${doc.id}`).then(fullDoc => {
+           if (fullDoc.lexicon_json) setLexicon(fullDoc.lexicon_json);
+           if (fullDoc.doc_translation) setDocTranslation(fullDoc.doc_translation);
+        });
+      } catch (e) {}
     }
   };
 
@@ -223,13 +264,24 @@ export default function Home() {
       try {
         const data = await apiFetch("/progress");
         setProgress(data.percentage);
+        
+        // Fetch partial results for real-time analysis
+        if (activeDoc) {
+          const docData = await apiFetch(`/documents/${activeDoc.id}`);
+          if (docData.lexicon_json) {
+            setLexicon(docData.lexicon_json);
+          }
+          if (docData.doc_translation) {
+            setDocTranslation(docData.doc_translation);
+          }
+        }
       } catch (e) {}
-    }, 1000);
+    }, 2000);
 
     try {
       const data = await apiFetch("/process_document", {
         method: "POST",
-        body: JSON.stringify({ text: inputText, language }),
+        body: JSON.stringify({ text: inputText, language, document_id: activeDoc.id }),
       });
       setLexicon(data.words);
       setDocTranslation(data.document_translation);
@@ -250,7 +302,7 @@ export default function Home() {
     }
   };
 
-  const handleSelection = () => {
+  const handleSelection = async () => {
     const selection = window.getSelection();
     const selectedStr = selection?.toString().trim();
     if (selection && selectedStr && selectedStr.length > 0) {
@@ -266,9 +318,25 @@ export default function Home() {
             morphemes: [] 
           };
       });
+      
       const instantTranslation = breakdown.map(b => b.contextual_meaning).filter(m => m !== "Unanalyzed").join(" ");
       setAnalysis({ text: selectedStr, translation: instantTranslation || "Selection active.", breakdown: breakdown });
       setIsHeaderExpanded(false);
+
+      // Fetch holistic translation in background ONLY for multi-word selections
+      if (words.length > 1) {
+        try {
+          const data = await apiFetch("/translate", {
+            method: "POST",
+            body: JSON.stringify({ text: selectedStr, target: "en" })
+          });
+          if (data.translation) {
+            setAnalysis(prev => prev && prev.text === selectedStr ? { ...prev, translation: data.translation } : prev);
+          }
+        } catch (e) {
+          console.error("Background translation failed", e);
+        }
+      }
     }
   };
 
@@ -390,7 +458,7 @@ export default function Home() {
                 <button onClick={createNewDoc} className="px-6 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full text-xs font-bold uppercase tracking-widest transition-all shadow-lg">New Analysis</button>
               </div>
             </div>
-            <Library documents={documents} onCreateNew={createNewDoc} onLoadDoc={loadDocument} theme={theme} currentTheme={currentTheme} />
+            <Library documents={documents} onCreateNew={createNewDoc} onLoadDoc={loadDocument} onDeleteDoc={deleteDocument} theme={theme} currentTheme={currentTheme} />
           </div>
         </div>
       ) : !activeDoc ? (
@@ -460,7 +528,7 @@ export default function Home() {
                   {activeTab === "matrix" ? (
                     <MatrixView 
                       breakdown={analysis.breakdown} theme={theme} currentTheme={currentTheme}
-                      onUpdateLexicon={updateLexiconEntry} onMorphemeEdit={handleMorphemeEdit}
+                      onUpdateLexicon={updateLexiconEntry} onDeleteLexiconEntry={deleteLexiconEntry} onMorphemeEdit={handleMorphemeEdit}
                       onFindConcordance={findConcordance} onSpeak={speakText}
                     />
                   ) : activeTab === "syntax" ? (

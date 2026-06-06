@@ -21,6 +21,7 @@ backend/.env.local
 # Database
 *.db
 *.sqlite3
+!backend/drishti.db
 
 # Logs
 npm-debug.log*

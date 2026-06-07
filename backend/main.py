@@ -117,7 +117,7 @@ class AnalysisRequest(BaseModel):
     document_id: Optional[int] = None
 
 class LexiconMap(BaseModel):
-    words: Dict[str, WordBreakdown]
+    words: Dict[str, Any]
     document_translation: str
 
 # --- DB Dependency ---
@@ -131,17 +131,8 @@ def get_db():
 # --- Helper Functions for AI ---
 
 def get_filtered_models():
-    try:
-        models = []
-        exclude = ['tts', 'robotics', 'computer-use', 'image', 'clip', 'deep-research', '2.5']
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                if not any(x in m.name.lower() for x in exclude):
-                    models.append(m.name)
-        models.sort(key=lambda x: ('2.0' in x or 'flash' in x), reverse=True)
-        return models if models else ['models/gemini-1.5-flash', 'models/gemini-pro-latest']
-    except:
-        return ['models/gemini-1.5-flash']
+    # Using available models found in the environment
+    return ['models/gemini-2.0-flash', 'models/gemini-3.5-flash', 'models/gemini-flash-latest']
 
 async def gemini_ai_call(prompt: str, is_json: bool = False):
     models = get_filtered_models()
@@ -345,8 +336,8 @@ async def process_chunk(words_subset: List[str], language: str, full_context: st
     Return STRICT JSON:
     {{
       "words": {{
-        "token": {{
-          "word": "token",
+        "actual_word_from_list": {{
+          "word": "actual_word_from_list",
           "transliteration": "scientific",
           "contextual_meaning": "meaning in context",
           "pos": "POS",
@@ -361,7 +352,42 @@ async def process_chunk(words_subset: List[str], language: str, full_context: st
     
     res = await gemini_ai_call(prompt, is_json=True)
     parsed = safe_json_loads(res)
-    return parsed if parsed else {"words": {}}
+    
+    if not parsed or "words" not in parsed:
+        return {"words": {}}
+
+    # Robust Cleaning Logic
+    cleaned_words = {}
+    for key, val in parsed["words"].items():
+        if not isinstance(val, dict):
+            continue
+            
+        # Case 1: AI nested it under an extra "token" or "data" key
+        # e.g., {"word": {"token": {...}}}
+        if "token" in val and isinstance(val["token"], dict):
+            val = val["token"]
+        elif "data" in val and isinstance(val["data"], dict):
+            val = val["data"]
+            
+        # Case 2: AI used "token" instead of "word" as the internal key
+        if "token" in val and "word" not in val:
+            val["word"] = val["token"]
+            
+        # Ensure all required fields exist to prevent Pydantic crashes
+        required_fields = ["word", "transliteration", "contextual_meaning", "pos", "syntax_relation", "morphemes"]
+        if all(field in val for field in required_fields):
+            cleaned_words[key] = val
+        else:
+            # If some fields are missing, try to fill them with defaults rather than crashing
+            val.setdefault("word", key)
+            val.setdefault("transliteration", "...")
+            val.setdefault("contextual_meaning", "...")
+            val.setdefault("pos", "???")
+            val.setdefault("syntax_relation", "...")
+            val.setdefault("morphemes", [])
+            cleaned_words[key] = val
+
+    return {"words": cleaned_words}
 
 processing_progress = {"current": 0, "total": 0}
 
